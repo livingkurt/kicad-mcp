@@ -867,6 +867,10 @@ impl KiCadIpcClient {
     /// top-level sibling, write it back, then have KiCAD reload from disk. Returns
     /// the new via's real KIID (found by matching position + net after reload)
     /// rather than echoing the caller's input args back as if they were confirmed.
+    /// Also decodes the re-queried via's PadStack (drill.diameter + each
+    /// copper_layers[].size) and confirms it matches the requested drill/pad
+    /// size — position+net alone previously let a wrong-geometry via (e.g.
+    /// KiCAD silently falling back to a default drill/pad) report success.
     pub fn add_via(&self, net_name: &str, x: f64, y: f64, drill: f64, pad_size: f64) -> Result<String> {
         let net_code = self.resolve_net_code(net_name)?;
         let sexp = crate::builders::via_sexp(net_name, net_code, x, y, drill, pad_size);
@@ -878,6 +882,8 @@ impl KiCadIpcClient {
 
         let x_nm = crate::builders::mm_to_nm(x);
         let y_nm = crate::builders::mm_to_nm(y);
+        let drill_nm = crate::builders::mm_to_nm(drill);
+        let size_nm = crate::builders::mm_to_nm(pad_size);
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbVia)?;
         for item in &items {
             if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
@@ -893,6 +899,82 @@ impl KiCadIpcClient {
                     .map(|c| c.value)
                     .unwrap_or(0);
                 if pos.x_nm == x_nm && pos.y_nm == y_nm && via_net_code == net_code {
+                    // Position and net matched, but KiCAD has separately
+                    // reported an "accepted" mutation with the wrong result
+                    // before (the whole reason every mutating tool in this
+                    // fork round-trips) — decode the padstack it actually
+                    // persisted and confirm the drill/pad geometry too,
+                    // not just where the via sits and what net it's on.
+                    let pad_stack = via.pad_stack.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "via at ({}, {}) on net '{}' matched position/net but has no \
+                             pad_stack in the re-queried item — can't confirm drill/pad size",
+                            x,
+                            y,
+                            net_name
+                        )
+                    })?;
+                    let actual_drill_nm = pad_stack
+                        .drill
+                        .as_ref()
+                        .and_then(|d| d.diameter.as_ref())
+                        .map(|d| d.x_nm)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "via at ({}, {}) on net '{}' has no drill diameter in its \
+                                 re-queried pad_stack — can't confirm it matches the requested \
+                                 {}mm",
+                                x,
+                                y,
+                                net_name,
+                                drill
+                            )
+                        })?;
+                    if actual_drill_nm != drill_nm {
+                        anyhow::bail!(
+                            "via at ({}, {}) on net '{}' was created with drill {}mm, not the \
+                             requested {}mm",
+                            x,
+                            y,
+                            net_name,
+                            crate::builders::nm_to_mm(actual_drill_nm),
+                            drill
+                        );
+                    }
+                    if pad_stack.copper_layers.is_empty() {
+                        anyhow::bail!(
+                            "via at ({}, {}) on net '{}' has no copper_layers in its re-queried \
+                             pad_stack — can't confirm pad size matches the requested {}mm",
+                            x,
+                            y,
+                            net_name,
+                            pad_size
+                        );
+                    }
+                    for layer in &pad_stack.copper_layers {
+                        let size = layer.size.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "via at ({}, {}) on net '{}' has a copper_layers entry with no \
+                                 size — can't confirm pad size matches the requested {}mm",
+                                x,
+                                y,
+                                net_name,
+                                pad_size
+                            )
+                        })?;
+                        if size.x_nm != size_nm || size.y_nm != size_nm {
+                            anyhow::bail!(
+                                "via at ({}, {}) on net '{}' was created with pad size \
+                                 {}x{}mm, not the requested {}mm",
+                                x,
+                                y,
+                                net_name,
+                                crate::builders::nm_to_mm(size.x_nm),
+                                crate::builders::nm_to_mm(size.y_nm),
+                                pad_size
+                            );
+                        }
+                    }
                     return Ok(via.id.map(|k| k.value).unwrap_or_default());
                 }
             }
