@@ -619,19 +619,20 @@ async fn handle_refill_zones(
             }))
             .unwrap(),
         )),
-        _ => {
-            // Fallback: run kicad-cli with zone-fill option if supported
-            // kicad-cli pcb export gerber fills zones as a side effect
-            // For now report the limitation
-            Ok(CallToolResult::text(
-                serde_json::to_string_pretty(&json!({
-                    "success": false,
-                    "note": "Zone refill requires a running KiCAD instance with IPC enabled, or manual zone fill in KiCAD GUI",
-                    "board": board.to_str().unwrap_or("")
-                }))
-                .unwrap(),
-            ))
-        }
+        // The previous catch-all here discarded the real reason (IPC not connected,
+        // KiCAD not ready, or — now that client::refill_zones() actually confirms
+        // the fill landed instead of trusting KiCAD's outer "accepted" response — a
+        // genuine fill-completion timeout) behind a generic, identical-looking
+        // "success: false" message, so a real failure and "IPC just isn't configured"
+        // were indistinguishable to the caller. Surface it as a tool error instead.
+        Ok(Err(msg)) => Ok(CallToolResult::error(format!(
+            "Zone refill failed (IPC error: {}). KiCAD must be running with the board loaded.",
+            msg
+        ))),
+        Err(e) => Ok(CallToolResult::error(format!(
+            "Zone refill failed: {}",
+            e
+        ))),
     }
 }
 

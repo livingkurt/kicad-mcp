@@ -4,6 +4,9 @@
 //! delete PCB items via the IPC API.
 
 use crate::gen::kiapi;
+use anyhow::{anyhow, Context, Result};
+use prost::Message;
+use std::path::PathBuf;
 
 /// Converts millimeters to KiCAD nanometers.
 pub fn mm_to_nm(mm: f64) -> i64 {
@@ -83,8 +86,8 @@ pub fn build_track(
     }
 }
 
-/// Build S-expression for a via (used with ParseAndCreateItemsFromString).
-/// Complex protobuf PadStack construction is avoided this way.
+/// Build S-expression for a via, spliced directly into the board file (see
+/// `client::add_via`). Complex protobuf PadStack construction is avoided this way.
 pub fn via_sexp(
     net_name: &str,
     net_code: i32,
@@ -93,10 +96,126 @@ pub fn via_sexp(
     drill_mm: f64,
     size_mm: f64,
 ) -> String {
+    // Confirmed live against KiCAD's own file writer (by round-tripping a
+    // spliced via through SaveDocument and reading back what KiCAD itself
+    // wrote): a net-0/unconnected via's (net ...) clause is just the empty
+    // name, `(net "")`, with no code — including a code there, as this used
+    // to unconditionally, made KiCAD's file parser reject the file outright
+    // with an unrecoverable "Error" dialog on reload. That bug was invisible
+    // before because ParseAndCreateItemsFromString (the previous, now-dead
+    // delivery path) never actually parsed this string at all. For a real
+    // (non-zero) net, `(net CODE "NAME")` is used, matching how named nets
+    // are referenced elsewhere in the file format.
+    let net_clause = if net_code == 0 {
+        "(net \"\")".to_string()
+    } else {
+        format!("(net {} \"{}\")", net_code, net_name)
+    };
     format!(
-        r#"(via (at {} {}) (size {}) (drill {}) (layers "F.Cu" "B.Cu") (net {} "{}"))"#,
-        x, y, size_mm, drill_mm, net_code, net_name
+        r#"(via (at {} {}) (size {}) (drill {}) (layers "F.Cu" "B.Cu") {})"#,
+        x, y, size_mm, drill_mm, net_clause
     )
+}
+
+/// Resolve a "Library:Footprint" id to the on-disk path of its .kicad_mod file
+/// by reading the user's fp-lib-table and expanding any `${VAR}` in its URI.
+///
+/// `ParseAndCreateItemsFromString` needs a COMPLETE footprint S-expression
+/// (pads, shapes, properties) — KiCAD 10's IPC API has no "place from library"
+/// command that resolves a bare library id on its own, so the real file has to
+/// be read and spliced (see `instantiate_footprint_sexp`) rather than just
+/// referencing the id and hoping KiCAD fills in the rest.
+pub fn resolve_footprint_file(lib_id: &str) -> Result<PathBuf> {
+    let (lib_name, fp_name) = lib_id
+        .split_once(':')
+        .ok_or_else(|| anyhow!("footprint id '{}' must be 'Library:Footprint'", lib_id))?;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let table_path = PathBuf::from(home).join(".config/kicad/10.0/fp-lib-table");
+    let table = std::fs::read_to_string(&table_path)
+        .with_context(|| format!("could not read fp-lib-table at {}", table_path.display()))?;
+
+    let needle = format!("(name \"{}\")", lib_name);
+    let line = table
+        .lines()
+        .find(|l| l.contains(&needle))
+        .ok_or_else(|| anyhow!("footprint library '{}' not found in fp-lib-table", lib_name))?;
+
+    let uri_start = line
+        .find("(uri \"")
+        .ok_or_else(|| anyhow!("malformed fp-lib-table entry for '{}'", lib_name))?
+        + 6;
+    let uri_end = line[uri_start..]
+        .find('"')
+        .ok_or_else(|| anyhow!("malformed fp-lib-table entry for '{}'", lib_name))?
+        + uri_start;
+    let expanded = expand_env_vars(&line[uri_start..uri_end]);
+
+    Ok(PathBuf::from(expanded).join(format!("{}.kicad_mod", fp_name)))
+}
+
+/// Expand `${VAR}` references in a string against the process environment
+/// (KiCAD's own fp-lib-table convention, e.g. `${KICAD10_FOOTPRINT_DIR}`).
+fn expand_env_vars(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut var = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == '}' {
+                    break;
+                }
+                var.push(c2);
+            }
+            out.push_str(&std::env::var(&var).unwrap_or_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Turn a raw library `.kicad_mod` footprint definition into a board-instance
+/// S-expression: overrides the top-level layer, inserts a placement
+/// `(at x y rotation)` (library footprints carry no position of their own —
+/// that only exists once placed on a board), and sets the Reference
+/// property's text (library files always ship the literal placeholder
+/// "REF**"). Does this via targeted string splicing rather than a full
+/// S-expression parser — safe because KiCAD's own footprint generator always
+/// emits the top-level `(layer ...)` clause first, before any nested
+/// pad/property `(layer ...)` sub-clauses.
+pub fn instantiate_footprint_sexp(
+    raw: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    layer: &str,
+    reference: &str,
+) -> Result<String> {
+    let clause_start = raw
+        .find("(layer \"")
+        .ok_or_else(|| anyhow!("footprint file has no top-level layer clause"))?;
+    let quote_close = clause_start + 8 + raw[clause_start + 8..]
+        .find('"')
+        .ok_or_else(|| anyhow!("malformed layer clause"))?;
+    let paren_close = quote_close
+        + raw[quote_close..]
+            .find(')')
+            .ok_or_else(|| anyhow!("malformed layer clause"))?;
+
+    let mut out = String::with_capacity(raw.len() + 64);
+    out.push_str(&raw[..clause_start]);
+    out.push_str(&format!("(layer \"{}\")", layer));
+    out.push_str(&format!("\n\t(at {} {} {})", x, y, rotation));
+    out.push_str(&raw[paren_close + 1..]);
+
+    Ok(if reference.is_empty() {
+        out
+    } else {
+        out.replacen("\"REF**\"", &format!("\"{}\"", reference), 1)
+    })
 }
 
 /// Pack a protobuf message into a prost_types::Any.
@@ -107,6 +226,29 @@ pub fn pack_any<M: prost::Message>(msg: &M, type_name: &str) -> prost_types::Any
         type_url: format!("type.googleapis.com/{}", type_name),
         value: buf,
     }
+}
+
+/// A minimal partial-decode of just the `id` field shared by every board item type.
+/// Every concrete item message (Track, Via, FootprintInstance, Zone, BoardGraphicShape,
+/// BoardText, ...) declares `kiapi.common.types.KIID id` at protobuf tag 1 (confirmed
+/// against board_types.proto), and protobuf's wire format allows decoding just that one
+/// field while ignoring the rest of the message — so this works for any item type
+/// without a big match over concrete decoders.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ItemIdOnly {
+    #[prost(message, optional, tag = "1")]
+    id: Option<kiapi::common::types::Kiid>,
+}
+
+/// Pull the KIID back out of a serialized board item (as returned in a
+/// CreateItems/UpdateItems response), regardless of its concrete type. Used to
+/// independently re-query items KiCAD's own mutation response claims it
+/// created/updated, instead of trusting the response body at face value.
+pub fn extract_item_kiid(any: &prost_types::Any) -> Option<String> {
+    ItemIdOnly::decode(any.value.as_slice())
+        .ok()?
+        .id
+        .map(|k| k.value)
 }
 
 // --- Graphic primitive builders (BoardGraphicShape + BoardText) --------------

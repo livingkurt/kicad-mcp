@@ -60,6 +60,94 @@ fn unpack_any<M: Message + Default>(any: &prost_types::Any) -> Result<M> {
     M::decode(any.value.as_slice()).context("Failed to decode protobuf Any body")
 }
 
+/// Check the request-level ItemRequestStatus that CreateItems/UpdateItems/
+/// DeleteItems responses carry. KiCAD's own proto comments warn this can be
+/// IRS_OK even when zero items were actually touched — real success also
+/// requires checking the per-item results (see `check_item_status` /
+/// `check_deletion_status`), which is why callers check both.
+fn check_item_request_status(status: i32, op: &str) -> Result<()> {
+    let code = kiapi::common::types::ItemRequestStatus::try_from(status)
+        .unwrap_or(kiapi::common::types::ItemRequestStatus::IrsUnknown);
+    if code != kiapi::common::types::ItemRequestStatus::IrsOk {
+        anyhow::bail!("{} request failed: {}", op, code.as_str_name());
+    }
+    Ok(())
+}
+
+/// Check one item's ItemStatus, as returned per-item by CreateItems/UpdateItems.
+fn check_item_status(status: Option<&kiapi::common::commands::ItemStatus>, op: &str) -> Result<()> {
+    let status = match status {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    let code = kiapi::common::commands::ItemStatusCode::try_from(status.code)
+        .unwrap_or(kiapi::common::commands::ItemStatusCode::IscUnknown);
+    if code != kiapi::common::commands::ItemStatusCode::IscOk {
+        let detail = if status.error_message.is_empty() {
+            code.as_str_name().to_string()
+        } else {
+            status.error_message.clone()
+        };
+        anyhow::bail!("{} failed for an item: {}", op, detail);
+    }
+    Ok(())
+}
+
+/// Check one item's ItemDeletionStatus, as returned per-item by DeleteItems.
+fn check_deletion_status(status: i32, op: &str) -> Result<()> {
+    let code = kiapi::common::commands::ItemDeletionStatus::try_from(status)
+        .unwrap_or(kiapi::common::commands::ItemDeletionStatus::IdsUnknown);
+    if code != kiapi::common::commands::ItemDeletionStatus::IdsOk {
+        anyhow::bail!("{} failed for an item: {}", op, code.as_str_name());
+    }
+    Ok(())
+}
+
+/// Confirm KiCAD reported a result for every item requested. Confirmed live
+/// (2026-08-04): for a nonexistent/unresolvable item KiCAD does NOT include
+/// an error-status entry for it — it just omits it from the results array
+/// entirely, with the request-level status still IRS_OK. Per-item status
+/// checks alone can't catch that, since there's no per-item entry to check;
+/// a result-count mismatch is the only signal.
+fn check_result_count(requested: usize, returned: usize, op: &str) -> Result<()> {
+    if returned < requested {
+        anyhow::bail!(
+            "{} requested {} item(s) but KiCAD only returned a result for {} — \
+             the rest don't exist (or are otherwise unresolvable) on the board",
+            op,
+            requested,
+            returned
+        );
+    }
+    Ok(())
+}
+
+/// Insert an S-expression block as a top-level sibling inside a
+/// `.kicad_pcb` file, just before the file's closing paren. KiCAD's own
+/// `.kicad_pcb` format is a flat list of top-level clauses (`(footprint
+/// ...)`, `(via ...)`, `(gr_...)`, ...) inside one outer `(kicad_pcb ...)`
+/// s-expression, and KiCAD's own generator always emits the final `)` as
+/// the last non-whitespace character, so targeted string splicing (rather
+/// than a full S-expression parser) is safe here.
+fn splice_sexp_into_board(board_path: &std::path::Path, sexp_block: &str) -> Result<()> {
+    let raw = std::fs::read_to_string(board_path)
+        .with_context(|| format!("could not read board file {}", board_path.display()))?;
+    let trimmed = raw.trim_end();
+    let last_paren = trimmed
+        .rfind(')')
+        .ok_or_else(|| anyhow::anyhow!("board file {} has no closing paren", board_path.display()))?;
+    let mut out = String::with_capacity(raw.len() + sexp_block.len() + 8);
+    out.push_str(&trimmed[..last_paren]);
+    out.push('\n');
+    out.push_str(sexp_block);
+    out.push('\n');
+    out.push_str(&trimmed[last_paren..]);
+    out.push('\n');
+    std::fs::write(board_path, out)
+        .with_context(|| format!("could not write board file {}", board_path.display()))?;
+    Ok(())
+}
+
 pub struct KiCadIpcClient {
     socket_path: String,
     client_name: String,
@@ -156,9 +244,22 @@ impl KiCadIpcClient {
                 format!("ipc://{}", self.socket_path)
             };
 
-        socket
-            .dial(&dial_url)
-            .with_context(|| format!("Cannot connect to KiCAD IPC at {}", dial_url))?;
+        // Retry the dial briefly: each call opens a brand-new socket rather than
+        // reusing a persistent connection, and a momentarily-busy listener can
+        // refuse a connection attempt that would succeed a beat later. Chains of
+        // several calls in a row (as the round-trip re-queries added throughout
+        // this file now do) make that transient window more likely to get hit at
+        // least once, not less reliable overall — worth absorbing with a couple
+        // of short retries rather than failing the whole operation on it.
+        let mut dial_result = socket.dial(&dial_url);
+        for attempt in 0..2 {
+            if dial_result.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+            dial_result = socket.dial(&dial_url);
+        }
+        dial_result.with_context(|| format!("Cannot connect to KiCAD IPC at {}", dial_url))?;
 
         // Send request
         let msg = nng::Message::from(request_bytes.as_slice());
@@ -190,6 +291,40 @@ impl KiCadIpcClient {
 
         debug!("[BETA] IPC ← OK");
         Ok(response.message)
+    }
+
+    /// Send a mutating command wrapped in a KiCAD IPC commit transaction.
+    ///
+    /// KiCAD's IPC API requires every board edit to be bracketed with
+    /// BeginCommit/EndCommit(commit) — without it, KiCAD accepts the command
+    /// (the call returns Ok) but never actually applies/persists it, so the
+    /// edit silently vanishes. Every mutating call (CreateItems, UpdateItems,
+    /// DeleteItems, RefillZones, ParseAndCreateItemsFromString) must go
+    /// through this instead of calling `send_command` directly.
+    fn send_mutating_command(
+        &self,
+        command: &impl Message,
+        type_name: &str,
+        description: &str,
+    ) -> Result<Option<prost_types::Any>> {
+        let commit_id = self.begin_commit()?;
+        match self.send_command(command, type_name) {
+            Ok(resp) => {
+                if let Err(err) = self.push_commit(&commit_id, description) {
+                    // A failed push leaves the commit open server-side
+                    // (commits are keyed by client name), which permanently
+                    // fails every subsequent mutating call from this client
+                    // until pcbnew restarts. Drop it so the client recovers.
+                    let _ = self.drop_commit(&commit_id);
+                    return Err(err);
+                }
+                Ok(resp)
+            }
+            Err(err) => {
+                let _ = self.drop_commit(&commit_id);
+                Err(err)
+            }
+        }
     }
 
     // ─── Public API (same interface as before, tools don't change) ───────
@@ -319,38 +454,149 @@ impl KiCadIpcClient {
                         .map(|a| a.value_degrees)
                         .unwrap_or(0.0),
                     layer: layer_enum_to_name(fp.layer).to_string(),
+                    kiid: fp.id.as_ref().map(|k| k.value.clone()).unwrap_or_default(),
                 });
             }
         }
         Ok(footprints)
     }
 
-    /// Create items on the board.
+    /// Create items on the board. Checks the request-level status, that
+    /// KiCAD actually reported a result for every item requested (KiCAD
+    /// silently omits items it couldn't create from the results array
+    /// rather than reporting a per-item error for them — confirmed live:
+    /// an unresolvable item comes back as an empty results array with an
+    /// otherwise-OK request status), each item's own creation result, and —
+    /// on top of trusting CreateItems' own response — independently
+    /// re-resolves each created item by KIID via GetItemsById afterward
+    /// (see `confirm_items_exist`), the same round-trip principle already
+    /// applied to delete_items/place_footprint/add_via.
     pub fn create_items(&self, items: Vec<prost_types::Any>) -> Result<()> {
+        let requested = items.len();
         let header = self.make_header()?;
         let cmd = kiapi::common::commands::CreateItems {
             header: Some(header),
             items,
             container: None,
         };
-        self.send_command(&cmd, "kiapi.common.commands.CreateItems")?;
+        let resp_any =
+            self.send_mutating_command(&cmd, "kiapi.common.commands.CreateItems", "Create items")?
+                .ok_or_else(|| anyhow::anyhow!("CreateItems returned no response body"))?;
+        let resp: kiapi::common::commands::CreateItemsResponse = unpack_any(&resp_any)?;
+        check_item_request_status(resp.status, "CreateItems")?;
+        check_result_count(requested, resp.created_items.len(), "CreateItems")?;
+        let mut kiids = Vec::with_capacity(resp.created_items.len());
+        for result in &resp.created_items {
+            check_item_status(result.status.as_ref(), "CreateItems")?;
+            if let Some(id) = result.item.as_ref().and_then(crate::builders::extract_item_kiid) {
+                kiids.push(id);
+            }
+        }
+        self.confirm_items_exist(&kiids, "CreateItems")?;
         Ok(())
     }
 
     /// Update existing items by KIID. Generic wrapper mirroring create_items/delete_items;
     /// each `Any` must be a fully-formed board item with an existing `id` populated.
+    /// Checks the request-level status, that every requested item got a result, each
+    /// item's own update result, and — same as create_items — independently re-resolves
+    /// each updated item by KIID afterward rather than trusting the response alone.
     pub fn update_items(&self, items: Vec<prost_types::Any>) -> Result<()> {
+        let requested = items.len();
         let header = self.make_header()?;
         let cmd = kiapi::common::commands::UpdateItems {
             header: Some(header),
             items,
         };
-        self.send_command(&cmd, "kiapi.common.commands.UpdateItems")?;
+        let resp_any =
+            self.send_mutating_command(&cmd, "kiapi.common.commands.UpdateItems", "Update items")?
+                .ok_or_else(|| anyhow::anyhow!("UpdateItems returned no response body"))?;
+        let resp: kiapi::common::commands::UpdateItemsResponse = unpack_any(&resp_any)?;
+        check_item_request_status(resp.status, "UpdateItems")?;
+        check_result_count(requested, resp.updated_items.len(), "UpdateItems")?;
+        let mut kiids = Vec::with_capacity(resp.updated_items.len());
+        for result in &resp.updated_items {
+            check_item_status(result.status.as_ref(), "UpdateItems")?;
+            if let Some(id) = result.item.as_ref().and_then(crate::builders::extract_item_kiid) {
+                kiids.push(id);
+            }
+        }
+        self.confirm_items_exist(&kiids, "UpdateItems")?;
         Ok(())
     }
 
+    /// Independently re-resolve items by KIID via GetItemsById after a CreateItems/
+    /// UpdateItems call, confirming the mutation actually landed on the live board
+    /// rather than trusting the mutating call's own response — the same round-trip
+    /// principle `delete_items` already applies (pre-check) and `place_footprint`/
+    /// `add_via` already apply (post-check by re-query).
+    fn confirm_items_exist(&self, kiids: &[String], op: &str) -> Result<()> {
+        if kiids.is_empty() {
+            return Ok(());
+        }
+        let found = self.get_items_by_id(kiids)?;
+        if found.len() < kiids.len() {
+            anyhow::bail!(
+                "{} reported success but only {} of {} item(s) independently re-resolved by \
+                 KIID afterward — the mutation did not fully land",
+                op,
+                found.len(),
+                kiids.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// Poll `check` until it returns `Ok(true)` or `timeout` elapses. Needed because some
+    /// KiCAD API handlers (see `refill_zones`) report success from a synchronous call but
+    /// perform the actual mutation later, on a deferred event-loop tick — a same-instant
+    /// re-query can't be trusted there, so give the real effect a little time to land
+    /// before deciding a round-trip check failed.
+    fn poll_until<F>(
+        &self,
+        timeout: std::time::Duration,
+        interval: std::time::Duration,
+        mut check: F,
+    ) -> Result<bool>
+    where
+        F: FnMut() -> Result<bool>,
+    {
+        let start = std::time::Instant::now();
+        loop {
+            if check()? {
+                return Ok(true);
+            }
+            if start.elapsed() >= timeout {
+                return Ok(false);
+            }
+            std::thread::sleep(interval);
+        }
+    }
+
     /// Delete items by KIID.
+    ///
+    /// Confirms every requested KIID actually exists BEFORE issuing the
+    /// delete (via GetItemsById, the one command that reliably resolves an
+    /// arbitrary KIID regardless of item type) rather than trusting
+    /// DeleteItems' own response to say so. Confirmed live: KiCAD 10's
+    /// DeleteItems leaves `deleted_items` empty regardless of whether the
+    /// delete succeeded or failed — a real, verified-present KIID and a
+    /// bogus one both come back with zero entries and IRS_OK, so neither a
+    /// response count check nor a post-delete existence check can tell
+    /// them apart (post-delete, a *successful* delete's target is also, by
+    /// definition, "not found" — indistinguishable from never having
+    /// existed). A pre-delete existence check has no such ambiguity.
     pub fn delete_items(&self, ids: Vec<String>) -> Result<()> {
+        let existing = self.get_items_by_id(&ids)?;
+        if existing.len() < ids.len() {
+            anyhow::bail!(
+                "DeleteItems requested {} item(s) but only {} of them exist on the board \
+                 — the rest are bogus/nonexistent KIIDs",
+                ids.len(),
+                existing.len()
+            );
+        }
+
         let header = self.make_header()?;
         let cmd = kiapi::common::commands::DeleteItems {
             header: Some(header),
@@ -359,18 +605,105 @@ impl KiCadIpcClient {
                 .map(|id| kiapi::common::types::Kiid { value: id.clone() })
                 .collect(),
         };
-        self.send_command(&cmd, "kiapi.common.commands.DeleteItems")?;
+        let resp_any =
+            self.send_mutating_command(&cmd, "kiapi.common.commands.DeleteItems", "Delete items")?
+                .ok_or_else(|| anyhow::anyhow!("DeleteItems returned no response body"))?;
+        let resp: kiapi::common::commands::DeleteItemsResponse = unpack_any(&resp_any)?;
+        check_item_request_status(resp.status, "DeleteItems")?;
+        for result in &resp.deleted_items {
+            check_deletion_status(result.status, "DeleteItems")?;
+        }
         Ok(())
     }
 
+    /// Resolve KIIDs to their current item bodies, regardless of item type.
+    /// Used to confirm existence before/after mutating calls whose own
+    /// response bodies can't be trusted for that (see `delete_items`).
+    fn get_items_by_id(&self, ids: &[String]) -> Result<Vec<prost_types::Any>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let header = self.make_header()?;
+        let cmd = kiapi::common::commands::GetItemsById {
+            header: Some(header),
+            items: ids
+                .iter()
+                .map(|id| kiapi::common::types::Kiid { value: id.clone() })
+                .collect(),
+        };
+        match self.send_command(&cmd, "kiapi.common.commands.GetItemsById") {
+            Ok(Some(any)) => {
+                let resp: kiapi::common::commands::GetItemsResponse = unpack_any(&any)?;
+                Ok(resp.items)
+            }
+            Ok(None) => Ok(vec![]),
+            Err(e) => {
+                // Confirmed live: KiCAD returns a hard AS_BAD_REQUEST (rather
+                // than an empty result) when NONE of the requested KIIDs
+                // resolve — a legitimate "0 found" answer here, not a
+                // transport failure.
+                if e.to_string().contains("AS_BAD_REQUEST") {
+                    Ok(vec![])
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// Refill zones on the board.
+    ///
+    /// KiCAD's own RefillZones handler (confirmed by reading pcbnew/api/
+    /// api_handler_pcb.cpp's `handleRefillZones`) only fills synchronously when there's
+    /// no GUI frame attached (true headless CLI mode). Konnect's container runs a real
+    /// pcbnew GUI process under Xvfb — not KiCad's true headless mode, which doesn't
+    /// exist until KiCad 11 — so `frame()` is always non-null here, which means KiCad
+    /// takes the *other* branch: it schedules the fill via `frame()->CallAfter(...)` and
+    /// returns success immediately, before the fill geometry is actually computed. The
+    /// outer "request accepted" response is therefore not trustworthy proof the fill
+    /// happened by the time this call returns — poll each zone's own `filled` flag via
+    /// GetItems until every zone reports filled (or time out) before reporting success.
     pub fn refill_zones(&self) -> Result<()> {
         let doc = self.get_board_document()?;
         let cmd = kiapi::board::commands::RefillZones {
             board: Some(doc),
             zones: vec![],
         };
-        self.send_command(&cmd, "kiapi.board.commands.RefillZones")?;
+        self.send_mutating_command(&cmd, "kiapi.board.commands.RefillZones", "Refill zones")?;
+
+        let zones = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbZone)?;
+        if zones.is_empty() {
+            // Nothing to fill; RunAction(zoneFillAll) is a harmless no-op either way.
+            debug!("RefillZones: no zones on board, nothing to poll for");
+            return Ok(());
+        }
+        debug!("RefillZones: polling fill state of {} zone(s)", zones.len());
+
+        let all_filled = self.poll_until(
+            std::time::Duration::from_secs(15),
+            std::time::Duration::from_millis(200),
+            || {
+                let zones = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbZone)?;
+                let filled_count = zones
+                    .iter()
+                    .filter(|z| {
+                        kiapi::board::types::Zone::decode(z.value.as_slice())
+                            .map(|zone| zone.filled)
+                            .unwrap_or(false)
+                    })
+                    .count();
+                debug!("RefillZones: {}/{} zone(s) filled", filled_count, zones.len());
+                Ok(filled_count == zones.len())
+            },
+        )?;
+
+        if !all_filled {
+            anyhow::bail!(
+                "RefillZones was accepted by KiCAD but the fill did not complete within 15s \
+                 of polling — KiCAD defers the actual fill to a later event-loop tick when \
+                 running with a GUI frame, and it never reported all zones filled"
+            );
+        }
         Ok(())
     }
 
@@ -381,6 +714,42 @@ impl KiCadIpcClient {
             document: Some(doc),
         };
         self.send_command(&cmd, "kiapi.common.commands.SaveDocument")?;
+        Ok(())
+    }
+
+    /// Resolve the on-disk path of the currently open board, via the same
+    /// DocumentSpecifier (from GetOpenDocuments) that SaveDocument/
+    /// RevertDocument use internally to identify it. `board_filename` is
+    /// just the bare filename (confirmed live — e.g. "herc-verify.kicad_pcb",
+    /// not a path, despite reading like one), so it has to be joined with
+    /// the project directory from the specifier's `project.path`.
+    fn board_file_path(&self) -> Result<std::path::PathBuf> {
+        let doc = self.get_board_document()?;
+        let filename = match &doc.identifier {
+            Some(kiapi::common::types::document_specifier::Identifier::BoardFilename(name)) => {
+                name.clone()
+            }
+            _ => anyhow::bail!("open board document has no board_filename"),
+        };
+        let dir = doc
+            .project
+            .as_ref()
+            .map(|p| p.path.as_str())
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("open board document has no project path"))?;
+        Ok(std::path::PathBuf::from(dir).join(filename))
+    }
+
+    /// Reload the open board from disk, discarding pcbnew's in-memory state.
+    /// Confirmed (by reading KiCAD's own source) to do
+    /// `SetContentModified(false)` -> `ReleaseFile()` -> `OpenProjectFiles(...,
+    /// KICTL_REVERT)`, with no confirmation dialog even under Xvfb.
+    pub fn revert_document(&self) -> Result<()> {
+        let doc = self.get_board_document()?;
+        let cmd = kiapi::common::commands::RevertDocument {
+            document: Some(doc),
+        };
+        self.send_command(&cmd, "kiapi.common.commands.RevertDocument")?;
         Ok(())
     }
 
@@ -490,17 +859,50 @@ impl KiCadIpcClient {
         Ok(())
     }
 
-    /// Add a via to the board using S-expression string (simpler than full protobuf PadStack construction).
-    pub fn add_via(&self, net_name: &str, x: f64, y: f64, drill: f64, pad_size: f64) -> Result<()> {
+    /// Add a via to the board via S-expression string (simpler than full protobuf
+    /// PadStack construction). KiCAD 10's ParseAndCreateItemsFromString is a dead,
+    /// unimplemented no-op stub (confirmed by reading pcbnew/api/api_handler_pcb.cpp)
+    /// — it validates and returns success without ever creating anything. Route
+    /// around it: save the live board to disk, splice the via S-expression in as a
+    /// top-level sibling, write it back, then have KiCAD reload from disk. Returns
+    /// the new via's real KIID (found by matching position + net after reload)
+    /// rather than echoing the caller's input args back as if they were confirmed.
+    pub fn add_via(&self, net_name: &str, x: f64, y: f64, drill: f64, pad_size: f64) -> Result<String> {
         let net_code = self.resolve_net_code(net_name)?;
         let sexp = crate::builders::via_sexp(net_name, net_code, x, y, drill, pad_size);
-        let doc = self.get_board_document()?;
-        let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
-            document: Some(doc),
-            contents: sexp,
-        };
-        self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
-        Ok(())
+
+        self.save_board()?;
+        let board_path = self.board_file_path()?;
+        splice_sexp_into_board(&board_path, &sexp)?;
+        self.revert_document()?;
+
+        let x_nm = crate::builders::mm_to_nm(x);
+        let y_nm = crate::builders::mm_to_nm(y);
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+        for item in &items {
+            if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
+                let pos = via.position.unwrap_or_default();
+                // KiCAD omits the NetCode message entirely (leaves it None,
+                // not Some(0)) for net 0 — confirmed live. 0 is also net 0's
+                // fallback everywhere else in this file (see get_nets()'s
+                // IpcNet construction above), so match that convention here.
+                let via_net_code = via
+                    .net
+                    .as_ref()
+                    .and_then(|n| n.code.as_ref())
+                    .map(|c| c.value)
+                    .unwrap_or(0);
+                if pos.x_nm == x_nm && pos.y_nm == y_nm && via_net_code == net_code {
+                    return Ok(via.id.map(|k| k.value).unwrap_or_default());
+                }
+            }
+        }
+        anyhow::bail!(
+            "placed via at ({}, {}) on net '{}' but it's not visible on the board after reload",
+            x,
+            y,
+            net_name
+        )
     }
 
     /// Delete a track by UUID.
@@ -566,8 +968,10 @@ impl KiCadIpcClient {
         Ok(tracks)
     }
 
-    /// Move a footprint to a new position.
-    pub fn move_footprint(&self, reference: &str, x: f64, y: f64) -> Result<()> {
+    /// Move a footprint to a new position. Returns the independently re-queried,
+    /// post-move footprint state (not the caller's input) — see the round-trip
+    /// check below.
+    pub fn move_footprint(&self, reference: &str, x: f64, y: f64) -> Result<IpcFootprint> {
         // Find the footprint, update position, send UpdateItems
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
         for item in &items {
@@ -598,21 +1002,48 @@ impl KiCadIpcClient {
                     )?;
                     let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
 
-                    let header = self.make_header()?;
-                    let cmd = kiapi::common::commands::UpdateItems {
-                        header: Some(header),
-                        items: vec![any],
-                    };
-                    self.send_command(&cmd, "kiapi.common.commands.UpdateItems")?;
-                    return Ok(());
+                    // Route through update_items() rather than calling
+                    // send_mutating_command inline (as this used to) so moves get the
+                    // same per-item status + independent re-resolve-by-KIID checks
+                    // every other update goes through, instead of only trusting the
+                    // outer "request accepted" response.
+                    self.update_items(vec![any])?;
+
+                    // Round-trip: update_items() only proves *an* item update landed,
+                    // not that THIS footprint ended up at THIS position — re-fetch by
+                    // reference and confirm the reported position actually matches
+                    // what was requested.
+                    let confirmed = self.get_footprint(reference)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "moved '{}' but it's no longer resolvable by reference afterward",
+                            reference
+                        )
+                    })?;
+                    const EPS_MM: f64 = 1e-3;
+                    if (confirmed.position.x - x).abs() > EPS_MM
+                        || (confirmed.position.y - y).abs() > EPS_MM
+                    {
+                        anyhow::bail!(
+                            "move_footprint reported success for '{}' but re-query shows it \
+                             at ({}, {}), not the requested ({}, {})",
+                            reference,
+                            confirmed.position.x,
+                            confirmed.position.y,
+                            x,
+                            y
+                        );
+                    }
+                    return Ok(confirmed);
                 }
             }
         }
         anyhow::bail!("Footprint '{}' not found", reference)
     }
 
-    /// Rotate a footprint to a new angle.
-    pub fn rotate_footprint(&self, reference: &str, angle: f64) -> Result<()> {
+    /// Rotate a footprint to a new angle. Returns the independently re-queried,
+    /// post-rotate footprint state (not the caller's input) — see the round-trip
+    /// check below.
+    pub fn rotate_footprint(&self, reference: &str, angle: f64) -> Result<IpcFootprint> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
         for item in &items {
             if let Ok(mut fp) =
@@ -647,13 +1078,33 @@ impl KiCadIpcClient {
                         },
                     )?;
                     let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
-                    let header = self.make_header()?;
-                    let cmd = kiapi::common::commands::UpdateItems {
-                        header: Some(header),
-                        items: vec![any],
-                    };
-                    self.send_command(&cmd, "kiapi.common.commands.UpdateItems")?;
-                    return Ok(());
+
+                    // Same fix as move_footprint: go through update_items() for the
+                    // shared validation + re-resolve-by-KIID check instead of an
+                    // unvalidated inline send_mutating_command.
+                    self.update_items(vec![any])?;
+
+                    // Round-trip: re-fetch by reference and confirm the reported angle
+                    // actually matches what was requested (mod 360, since KiCAD
+                    // normalizes orientation).
+                    let confirmed = self.get_footprint(reference)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "rotated '{}' but it's no longer resolvable by reference afterward",
+                            reference
+                        )
+                    })?;
+                    const EPS_DEG: f64 = 1e-3;
+                    let norm = |a: f64| ((a % 360.0) + 360.0) % 360.0;
+                    if (norm(confirmed.rotation) - norm(angle)).abs() > EPS_DEG {
+                        anyhow::bail!(
+                            "rotate_footprint reported success for '{}' but re-query shows \
+                             rotation {}, not the requested {}",
+                            reference,
+                            confirmed.rotation,
+                            angle
+                        );
+                    }
+                    return Ok(confirmed);
                 }
             }
         }
@@ -666,7 +1117,8 @@ impl KiCadIpcClient {
         self.delete_items(vec![kiid])
     }
 
-    /// Place a footprint — currently requires KiCAD's ParseAndCreateItemsFromString.
+    /// Place a footprint by reading its real definition from the KiCAD footprint
+    /// library on disk and splicing it directly into the board file.
     pub fn place_footprint(
         &self,
         lib_id: &str,
@@ -674,37 +1126,46 @@ impl KiCadIpcClient {
         y: f64,
         rotation: f64,
         layer: &str,
+        reference: &str,
     ) -> Result<IpcFootprint> {
-        // KiCAD 10 IPC doesn't have a direct "place footprint from library" command.
-        // The CreateItems command requires a fully formed FootprintInstance protobuf,
-        // which needs the complete footprint definition (pads, shapes, etc.) from the library.
-        // For now, use ParseAndCreateItemsFromString with S-expression format.
-        let sexp = format!(
-            r#"(footprint "{lib_id}"
-  (layer "{layer}")
-  (at {x} {y} {rotation})
-)"#,
-            lib_id = lib_id,
-            layer = layer,
-            x = crate::builders::mm_to_nm(x) as f64 / 1_000_000.0,
-            y = crate::builders::mm_to_nm(y) as f64 / 1_000_000.0,
-            rotation = rotation,
-        );
-
-        let doc = self.get_board_document()?;
-        let cmd = kiapi::common::commands::ParseAndCreateItemsFromString {
-            document: Some(doc),
-            contents: sexp,
-        };
-        self.send_command(&cmd, "kiapi.common.commands.ParseAndCreateItemsFromString")?;
-
-        Ok(IpcFootprint {
-            reference: String::new(),
-            value: String::new(),
-            footprint: lib_id.to_string(),
-            position: IpcVector2 { x, y },
+        // KiCAD 10 IPC doesn't have a direct "place footprint from library" command,
+        // so the real definition is read off disk and spliced in with
+        // position/layer/reference (see instantiate_footprint_sexp) as before.
+        //
+        // What changed: KiCAD 10.0's ParseAndCreateItemsFromString is a dead,
+        // unimplemented no-op stub (confirmed by reading
+        // pcbnew/api/api_handler_pcb.cpp) — it validates the request and returns a
+        // clean success WITHOUT ever reading the S-expression content or creating
+        // anything. Routing the correct S-expression through it can never work.
+        // Instead: save the live board to disk, splice the footprint S-expression
+        // in as a top-level sibling, write it back, then have KiCAD reload the file
+        // from disk so the new footprint actually lands in its in-memory model.
+        let fp_path = crate::builders::resolve_footprint_file(lib_id)?;
+        let raw = std::fs::read_to_string(&fp_path)
+            .with_context(|| format!("could not read footprint file {}", fp_path.display()))?;
+        let sexp = crate::builders::instantiate_footprint_sexp(
+            &raw,
+            crate::builders::mm_to_nm(x) as f64 / 1_000_000.0,
+            crate::builders::mm_to_nm(y) as f64 / 1_000_000.0,
             rotation,
-            layer: layer.to_string(),
+            layer,
+            reference,
+        )?;
+
+        self.save_board()?;
+        let board_path = self.board_file_path()?;
+        splice_sexp_into_board(&board_path, &sexp)?;
+        self.revert_document()?;
+
+        // Read back the observed state rather than echoing the caller's input
+        // args — reloading and finding it is what actually proves the footprint
+        // made it onto the board (the previous echo-back is exactly why placement
+        // looked like it worked when it didn't: nothing was ever verified).
+        self.get_footprint(reference)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "placed '{}' but it's not visible on the board after reload",
+                reference
+            )
         })
     }
 

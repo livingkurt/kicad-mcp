@@ -471,9 +471,9 @@ async fn handle_add_via(
     let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
 
     let net_ipc = net_name.clone();
-    ipc!(ctx, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
+    let kiid = ipc!(ctx, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
     Ok(CallToolResult::json(
-        &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
+        &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size, "kiid": kiid }),
     ))
 }
 

@@ -14,6 +14,10 @@ pub struct IpcFootprint {
     pub position: IpcVector2,
     pub rotation: f64,
     pub layer: String,
+    /// The board's real KIID for this footprint, when known (empty if not
+    /// resolved). Populated from observed board state, never echoed back
+    /// from caller input.
+    pub kiid: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

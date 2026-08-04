@@ -261,14 +261,16 @@ async fn handle_place_component(
     };
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
+    let reference = args["reference"].as_str().unwrap_or("").to_string();
 
     let fp = ipc!(ctx, |c| c
-        .place_footprint(&footprint, x, y, rotation, &layer));
+        .place_footprint(&footprint, x, y, rotation, &layer, &reference));
     Ok(CallToolResult::json(&json!({
         "placed": fp.reference,
         "footprint": fp.footprint,
         "x": fp.position.x, "y": fp.position.y,
-        "rotation": fp.rotation, "layer": fp.layer
+        "rotation": fp.rotation, "layer": fp.layer,
+        "kiid": fp.kiid
     })))
 }
 
@@ -290,10 +292,14 @@ async fn handle_move_component(
     };
 
     let ref_ipc = reference.clone();
-    ipc!(ctx, |c| c.move_footprint(&ref_ipc, x, y));
-    Ok(CallToolResult::json(
-        &json!({ "moved": reference, "x": x, "y": y }),
-    ))
+    // Report the independently re-queried post-move state that move_footprint() now
+    // returns, not the caller's raw input — the input is only reachable here at all
+    // once move_footprint() has already confirmed it matches, but reporting the
+    // confirmed value directly keeps this handler honest on its own terms too.
+    let fp = ipc!(ctx, |c| c.move_footprint(&ref_ipc, x, y));
+    Ok(CallToolResult::json(&json!({
+        "moved": fp.reference, "x": fp.position.x, "y": fp.position.y
+    })))
 }
 
 async fn handle_rotate_component(
@@ -310,10 +316,12 @@ async fn handle_rotate_component(
     };
 
     let ref_ipc = reference.clone();
-    ipc!(ctx, |c| c.rotate_footprint(&ref_ipc, rotation));
-    Ok(CallToolResult::json(
-        &json!({ "rotated": reference, "rotation": rotation }),
-    ))
+    // Same as move_component: report rotate_footprint()'s independently re-queried
+    // post-rotate state, not the raw input.
+    let fp = ipc!(ctx, |c| c.rotate_footprint(&ref_ipc, rotation));
+    Ok(CallToolResult::json(&json!({
+        "rotated": fp.reference, "rotation": fp.rotation
+    })))
 }
 
 async fn handle_delete_component(
@@ -521,13 +529,15 @@ async fn handle_place_array(
             let reference = format!("{prefix}{n}");
             let fp_id = footprint.clone();
             let ref2 = reference.clone();
+            let ref3 = reference.clone();
             match with_ipc(ctx.config.ipc_address.clone(), move |c| {
-                c.place_footprint(&fp_id, x, y, 0.0, "F.Cu")
+                c.place_footprint(&fp_id, x, y, 0.0, "F.Cu", &ref3)
             })
             .await?
             {
-                Ok(fp) => placed
-                    .push(json!({ "reference": ref2, "x": fp.position.x, "y": fp.position.y })),
+                Ok(fp) => placed.push(json!({
+                    "reference": ref2, "x": fp.position.x, "y": fp.position.y, "kiid": fp.kiid
+                })),
                 Err(e) => {
                     return Ok(CallToolResult::error(format!(
                         "IPC error placing {}: {}",
@@ -593,7 +603,7 @@ async fn handle_duplicate_component(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let _new_reference = match require_str(args, "new_reference") {
+    let new_reference = match require_str(args, "new_reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
@@ -618,12 +628,14 @@ async fn handle_duplicate_component(
         x,
         y,
         src.rotation,
-        &src.layer
+        &src.layer,
+        &new_reference
     ));
     Ok(CallToolResult::json(&json!({
         "duplicated_from": reference,
         "new_reference": fp.reference,
-        "x": fp.position.x, "y": fp.position.y
+        "x": fp.position.x, "y": fp.position.y,
+        "kiid": fp.kiid
     })))
 }
 

@@ -1,6 +1,7 @@
 mod config;
 mod install;
 mod manifest;
+mod selftest;
 mod transport;
 
 use anyhow::Result;
@@ -23,6 +24,9 @@ async fn main() -> Result<()> {
         Some("skill") => {
             let name = args.get(2).map(String::as_str).unwrap_or("");
             return install::print_skill_content(name);
+        }
+        Some("--selftest") => {
+            std::process::exit(selftest::run_selftest());
         }
         Some("--version") | Some("-V") => {
             println!("konnect {}", env!("CARGO_PKG_VERSION"));
@@ -119,6 +123,9 @@ fn print_help() {
     println!("  konnect uninstall        Remove all installed files");
     println!("  konnect status           Show install state");
     println!("  konnect skill <name>     Print skill content (for hooks)");
+    println!("  konnect --selftest       Probe flaky/version-dependent IPC capabilities against");
+    println!("                           the currently open board and print PASS/FAIL (used by");
+    println!("                           entrypoint.sh at container boot)");
     println!("  konnect --config <path>  Start server with config file");
     println!("  konnect --version        Print version");
     println!("  konnect --help           This message");

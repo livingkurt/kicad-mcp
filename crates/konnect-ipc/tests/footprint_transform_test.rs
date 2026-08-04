@@ -132,10 +132,18 @@ fn mk_footprint_r1() -> kiapi::board::types::FootprintInstance {
 type CapturedUpdate = Arc<Mutex<Option<kiapi::common::commands::UpdateItems>>>;
 
 /// Mock KiCAD serving `fp` for GetItems and recording the UpdateItems it
-/// receives.
+/// receives. Stateful: after an UpdateItems request, the footprint the mock
+/// serves back on the next GetItems reflects the update. Needed because
+/// move_footprint()/rotate_footprint() now independently re-query the
+/// footprint after mutating it (the round-trip check that replaced trusting
+/// KiCAD's outer "request accepted" response) — a mock that always echoed
+/// back the original, unmoved footprint would make that check fail even
+/// though the update itself was captured correctly.
 fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKicad, CapturedUpdate) {
     let captured: CapturedUpdate = Arc::new(Mutex::new(None));
     let captured_in_mock = captured.clone();
+    let state: Arc<Mutex<kiapi::board::types::FootprintInstance>> = Arc::new(Mutex::new(fp));
+    let state_in_mock = state.clone();
 
     let mock = spawn_mock(move |req| {
         let msg = req.message.expect("request must pack a command");
@@ -156,11 +164,12 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
                 "kiapi.common.commands.GetOpenDocumentsResponse",
             )))
         } else if msg.type_url.ends_with("GetItems") {
+            let current = state_in_mock.lock().unwrap().clone();
             let resp = kiapi::common::commands::GetItemsResponse {
                 header: None,
                 status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
                 items: vec![builders::pack_any(
-                    &fp,
+                    &current,
                     "kiapi.board.types.FootprintInstance",
                 )],
             };
@@ -171,8 +180,34 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
         } else if msg.type_url.ends_with("UpdateItems") {
             let update =
                 kiapi::common::commands::UpdateItems::decode(msg.value.as_slice()).unwrap();
+
+            // Reflect the update into served state so the client's own
+            // post-mutation re-query sees the change, same as real KiCAD.
+            if let Some(sent_any) = update.items.first() {
+                if let Ok(new_fp) =
+                    kiapi::board::types::FootprintInstance::decode(sent_any.value.as_slice())
+                {
+                    *state_in_mock.lock().unwrap() = new_fp;
+                }
+            }
+            let echoed_item = update.items.first().cloned();
             *captured_in_mock.lock().unwrap() = Some(update);
-            Some(ok_response())
+
+            let resp = kiapi::common::commands::UpdateItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                updated_items: vec![kiapi::common::commands::ItemUpdateResult {
+                    status: Some(kiapi::common::commands::ItemStatus {
+                        code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                        error_message: String::new(),
+                    }),
+                    item: echoed_item,
+                }],
+            };
+            Some(reply_with(builders::pack_any(
+                &resp,
+                "kiapi.common.commands.UpdateItemsResponse",
+            )))
         } else {
             Some(ok_response())
         }
