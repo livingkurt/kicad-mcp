@@ -247,6 +247,10 @@ async fn handle_place_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board = match require_str(args, "board") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
     let footprint = match require_str(args, "footprint") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -263,8 +267,13 @@ async fn handle_place_component(
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
     let reference = args["reference"].as_str().unwrap_or("").to_string();
 
-    let fp = ipc!(ctx, |c| c
-        .place_footprint(&footprint, x, y, rotation, &layer, &reference));
+    // Guard against silently mutating whatever board KiCAD happens to have
+    // open instead of the one the caller asked for — see
+    // KiCadIpcClient::verify_board_matches for why this is necessary.
+    let fp = ipc!(ctx, |c| {
+        c.verify_board_matches(std::path::Path::new(&board))?;
+        c.place_footprint(&footprint, x, y, rotation, &layer, &reference)
+    });
     Ok(CallToolResult::json(&json!({
         "placed": fp.reference,
         "footprint": fp.footprint,
@@ -278,6 +287,10 @@ async fn handle_move_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board = match require_str(args, "board") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -296,7 +309,13 @@ async fn handle_move_component(
     // returns, not the caller's raw input — the input is only reachable here at all
     // once move_footprint() has already confirmed it matches, but reporting the
     // confirmed value directly keeps this handler honest on its own terms too.
-    let fp = ipc!(ctx, |c| c.move_footprint(&ref_ipc, x, y));
+    // Also guard against silently moving a footprint on whatever board KiCAD
+    // happens to have open instead of the one the caller asked for — see
+    // KiCadIpcClient::verify_board_matches.
+    let fp = ipc!(ctx, |c| {
+        c.verify_board_matches(std::path::Path::new(&board))?;
+        c.move_footprint(&ref_ipc, x, y)
+    });
     Ok(CallToolResult::json(&json!({
         "moved": fp.reference, "x": fp.position.x, "y": fp.position.y
     })))
@@ -306,6 +325,10 @@ async fn handle_rotate_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board = match require_str(args, "board") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -317,8 +340,11 @@ async fn handle_rotate_component(
 
     let ref_ipc = reference.clone();
     // Same as move_component: report rotate_footprint()'s independently re-queried
-    // post-rotate state, not the raw input.
-    let fp = ipc!(ctx, |c| c.rotate_footprint(&ref_ipc, rotation));
+    // post-rotate state, not the raw input, and guard the board match.
+    let fp = ipc!(ctx, |c| {
+        c.verify_board_matches(std::path::Path::new(&board))?;
+        c.rotate_footprint(&ref_ipc, rotation)
+    });
     Ok(CallToolResult::json(&json!({
         "rotated": fp.reference, "rotation": fp.rotation
     })))
@@ -328,13 +354,20 @@ async fn handle_delete_component(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board = match require_str(args, "board") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
     let reference = match require_str(args, "reference") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
 
     let ref_ipc = reference.clone();
-    ipc!(ctx, |c| c.delete_footprint(&ref_ipc));
+    ipc!(ctx, |c| {
+        c.verify_board_matches(std::path::Path::new(&board))?;
+        c.delete_footprint(&ref_ipc)
+    });
     Ok(CallToolResult::json(&json!({ "deleted": reference })))
 }
 
@@ -473,10 +506,21 @@ async fn handle_get_pad_position(
 }
 
 async fn handle_get_component_list(
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let fps = ipc!(ctx, |c| c.list_footprints());
+    let board = match require_str(args, "board") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    // Guard against silently listing whatever board KiCAD happens to have
+    // open instead of the one the caller asked about — without this, a
+    // stale/wrong board's contents were reported as if they belonged to the
+    // requested file (see KiCadIpcClient::verify_board_matches).
+    let fps = ipc!(ctx, |c| {
+        c.verify_board_matches(std::path::Path::new(&board))?;
+        c.list_footprints()
+    });
     let items: Vec<serde_json::Value> = fps
         .iter()
         .map(|fp| {

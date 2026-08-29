@@ -740,6 +740,54 @@ impl KiCadIpcClient {
         Ok(std::path::PathBuf::from(dir).join(filename))
     }
 
+    /// Confirm `requested` is the same file KiCAD currently has open, before a
+    /// caller-supplied `board` argument is trusted to justify a mutating IPC
+    /// call.
+    ///
+    /// Root cause of the 2026-08-29 "place_component reports success and
+    /// get_component_list shows the new part, but the saved .kicad_pcb has
+    /// zero footprints" report: KiCAD's IPC API drives a single running GUI
+    /// instance with exactly one document open at a time (the container's
+    /// entrypoint.sh picks one board via a one-time directory scan at boot --
+    /// there is no IPC command to switch documents afterward). Every mutating
+    /// tool handler declared a `board` argument in its schema but never
+    /// checked it against reality, so a call whose `board` didn't match
+    /// KiCAD's one open document silently mutated whatever WAS open while
+    /// still reporting success -- the caller's actual target file was never
+    /// touched. This is confirmed live: a `place_component` call against a
+    /// project that was never the one open in KiCad succeeds, is visible via
+    /// `get_component_list` (same open board), and survives `save_project`
+    /// (same open board saved back to itself) -- while the requested board's
+    /// own .kicad_pcb on disk is untouched throughout.
+    ///
+    /// This is a distinct, previously-unfixed gap from the Phase 2
+    /// (2026-08-04/05) begin_commit/end_commit + splice/RevertDocument work,
+    /// which is confirmed still correct for the case that was actually
+    /// tested (requested board == the one open board).
+    pub fn verify_board_matches(&self, requested: &std::path::Path) -> Result<()> {
+        let open_path = self.board_file_path()?;
+        let requested_canon = requested
+            .canonicalize()
+            .unwrap_or_else(|_| requested.to_path_buf());
+        let open_canon = open_path
+            .canonicalize()
+            .unwrap_or_else(|_| open_path.clone());
+        if requested_canon != open_canon {
+            anyhow::bail!(
+                "requested board '{}' is not the board KiCAD currently has open \
+                 ('{}'). KiCAD's IPC API drives a single open document -- this call \
+                 would otherwise silently mutate the open board instead of the \
+                 requested file. Open '{}' in the KiCAD GUI (or restart the konnect \
+                 container with only that project present under /work) before \
+                 retrying.",
+                requested.display(),
+                open_path.display(),
+                requested.display()
+            );
+        }
+        Ok(())
+    }
+
     /// Reload the open board from disk, discarding pcbnew's in-memory state.
     /// Confirmed (by reading KiCAD's own source) to do
     /// `SetContentModified(false)` -> `ReleaseFile()` -> `OpenProjectFiles(...,
