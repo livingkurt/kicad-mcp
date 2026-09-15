@@ -88,32 +88,32 @@ pub fn build_track(
 
 /// Build S-expression for a via, spliced directly into the board file (see
 /// `client::add_via`). Complex protobuf PadStack construction is avoided this way.
-pub fn via_sexp(
-    net_name: &str,
-    net_code: i32,
-    x: f64,
-    y: f64,
-    drill_mm: f64,
-    size_mm: f64,
-) -> String {
-    // Confirmed live against KiCAD's own file writer (by round-tripping a
-    // spliced via through SaveDocument and reading back what KiCAD itself
-    // wrote): a net-0/unconnected via's (net ...) clause is just the empty
-    // name, `(net "")`, with no code — including a code there, as this used
-    // to unconditionally, made KiCAD's file parser reject the file outright
-    // with an unrecoverable "Error" dialog on reload. That bug was invisible
-    // before because ParseAndCreateItemsFromString (the previous, now-dead
-    // delivery path) never actually parsed this string at all. For a real
-    // (non-zero) net, `(net CODE "NAME")` is used, matching how named nets
-    // are referenced elsewhere in the file format.
-    let net_clause = if net_code == 0 {
-        "(net \"\")".to_string()
-    } else {
-        format!("(net {} \"{}\")", net_code, net_name)
-    };
+pub fn via_sexp(net_name: &str, x: f64, y: f64, drill_mm: f64, size_mm: f64) -> String {
+    // Corrected 2026-09-15: the previous comment here claimed `(net CODE
+    // "NAME")` was "confirmed live against KiCAD's own file writer" for a
+    // non-zero net — that claim doesn't hold. Pulled a real via straight off
+    // the live Aeos board (one KiCAD itself wrote, not one this fork spliced
+    // in) and it reads `(net "GND")` — just the name, no code, for a
+    // *connected* via too. The `net_code` field belongs elsewhere in the
+    // file format (e.g. the top-level `(net N "NAME")` declaration list) but
+    // not inside a `via`'s own clause. The old `(net CODE "NAME")` form put
+    // an unexpected integer token where KiCAD's via grammar expects a single
+    // string, and reproduced live (2026-09-15) as the exact same class of
+    // unrecoverable "Error loading PCB ... Expecting ')'" dialog this
+    // function's own history already flagged for the net-0 case — it just
+    // hadn't been hit yet for a *named* net, which is the overwhelming
+    // majority of real add_via calls. Dropped the now-unused `net_code`
+    // parameter entirely (the caller still resolves/validates it separately
+    // via `resolve_net_code` before calling this, it's just no longer needed
+    // here).
+    //
+    // Also added `(uuid ...)`: every real via in the file carries one; a
+    // freshly generated one avoids relying on KiCAD to backfill it on load
+    // (unconfirmed whether it does).
+    let uuid = konnect_sexp::writer::new_uuid();
     format!(
-        r#"(via (at {} {}) (size {}) (drill {}) (layers "F.Cu" "B.Cu") {})"#,
-        x, y, size_mm, drill_mm, net_clause
+        r#"(via (at {} {}) (size {}) (drill {}) (layers "F.Cu" "B.Cu") (net "{}") (uuid "{}"))"#,
+        x, y, size_mm, drill_mm, net_name, uuid
     )
 }
 

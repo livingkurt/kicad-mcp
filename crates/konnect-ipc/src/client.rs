@@ -1062,7 +1062,7 @@ impl KiCadIpcClient {
     /// KiCAD silently falling back to a default drill/pad) report success.
     pub fn add_via(&self, net_name: &str, x: f64, y: f64, drill: f64, pad_size: f64) -> Result<String> {
         let net_code = self.resolve_net_code(net_name)?;
-        let sexp = crate::builders::via_sexp(net_name, net_code, x, y, drill, pad_size);
+        let sexp = crate::builders::via_sexp(net_name, x, y, drill, pad_size);
 
         self.save_splice_revert(&sexp)?;
 
