@@ -1070,8 +1070,58 @@ impl KiCadIpcClient {
         let y_nm = crate::builders::mm_to_nm(y);
         let drill_nm = crate::builders::mm_to_nm(drill);
         let size_nm = crate::builders::mm_to_nm(pad_size);
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbVia)?;
-        for item in &items {
+        // Poll rather than a single get_items() call: reproduced live
+        // (2026-09-15) that RevertDocument's own IPC ack can return before
+        // pcbnew's in-memory object model has actually finished re-syncing
+        // from the just-reloaded document, so a get_items() fired
+        // immediately after can legitimately come back without the via
+        // that's already sitting correctly on disk — the same
+        // ack-before-actually-done class this file already polls for
+        // elsewhere (see refill_zones). A genuine geometry mismatch (found
+        // the via, wrong drill/pad) still bails immediately below, not
+        // retried — only "not found yet" is retried.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+            if let Some(result) = Self::match_placed_via(
+                &items, x, y, x_nm, y_nm, net_name, net_code, drill, drill_nm, pad_size, size_nm,
+            )? {
+                return Ok(result);
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "placed via at ({}, {}) on net '{}' but it's not visible on the board after \
+                     reload (waited 3s for RevertDocument's reload to be reflected in a \
+                     re-query)",
+                    x,
+                    y,
+                    net_name
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Scan `items` (a `get_items(KotPcbVia)` result) for a via at the
+    /// requested position/net, verify its geometry, and return its KIID.
+    /// `Ok(None)` means no matching via was found yet (caller may retry);
+    /// `Err` means a via was found but its geometry doesn't match, which is
+    /// a real data problem, not a timing one, and should not be retried.
+    #[allow(clippy::too_many_arguments)]
+    fn match_placed_via(
+        items: &[prost_types::Any],
+        x: f64,
+        y: f64,
+        x_nm: i64,
+        y_nm: i64,
+        net_name: &str,
+        net_code: i32,
+        drill: f64,
+        drill_nm: i64,
+        pad_size: f64,
+        size_nm: i64,
+    ) -> Result<Option<String>> {
+        for item in items {
             if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
                 let pos = via.position.unwrap_or_default();
                 // KiCAD omits the NetCode message entirely (leaves it None,
@@ -1161,16 +1211,11 @@ impl KiCadIpcClient {
                             );
                         }
                     }
-                    return Ok(via.id.map(|k| k.value).unwrap_or_default());
+                    return Ok(Some(via.id.map(|k| k.value).unwrap_or_default()));
                 }
             }
         }
-        anyhow::bail!(
-            "placed via at ({}, {}) on net '{}' but it's not visible on the board after reload",
-            x,
-            y,
-            net_name
-        )
+        Ok(None)
     }
 
     /// Delete a track by UUID.
