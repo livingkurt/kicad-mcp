@@ -122,30 +122,70 @@ fn check_result_count(requested: usize, returned: usize, op: &str) -> Result<()>
     Ok(())
 }
 
-/// Insert an S-expression block as a top-level sibling inside a
-/// `.kicad_pcb` file, just before the file's closing paren. KiCAD's own
-/// `.kicad_pcb` format is a flat list of top-level clauses (`(footprint
-/// ...)`, `(via ...)`, `(gr_...)`, ...) inside one outer `(kicad_pcb ...)`
-/// s-expression, and KiCAD's own generator always emits the final `)` as
-/// the last non-whitespace character, so targeted string splicing (rather
-/// than a full S-expression parser) is safe here.
-fn splice_sexp_into_board(board_path: &std::path::Path, sexp_block: &str) -> Result<()> {
-    let raw = std::fs::read_to_string(board_path)
-        .with_context(|| format!("could not read board file {}", board_path.display()))?;
-    let trimmed = raw.trim_end();
+/// Process-wide lock serializing every save→splice→revert sequence
+/// (`add_via`, `place_footprint`). Two overlapping sequences both splice
+/// into the same board file via a non-atomic read-modify-write
+/// (`splice_sexp_into_string` + `fs::write`) — without this, one can tear
+/// the other's write mid-flight. Held for the whole sequence, not just the
+/// write, since the read (save) and the write both need to be atomic with
+/// respect to each other across calls.
+static SAVE_SPLICE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Insert an S-expression block as a top-level sibling of an in-memory
+/// `.kicad_pcb` document's contents, just before the closing paren, and
+/// return the spliced result. In-memory sibling of the old
+/// `splice_sexp_into_board` (file-path version, no longer used — see
+/// `save_splice_revert`): same trim/rfind(')')/splice logic, but operating
+/// on an owned `String` instead of reading/writing a file directly, so it
+/// works whether the content came from disk (the save_board() fallback
+/// path) or straight over IPC (save_board_to_string()).
+///
+/// KiCAD's own `.kicad_pcb` format is a flat list of top-level clauses
+/// (`(footprint ...)`, `(via ...)`, `(gr_...)`, ...) inside one outer
+/// `(kicad_pcb ...)` s-expression, and KiCAD's own generator always emits
+/// the final `)` as the last non-whitespace character, so targeted string
+/// splicing (rather than a full rewrite via a S-expression parser) is safe
+/// here — but only once the input is confirmed to actually be a
+/// well-formed `.kicad_pcb` document. Both the input and the spliced
+/// output are parsed and checked for a `kicad_pcb` head before/after
+/// splicing; a truncated/torn read (or a splice that broke the file
+/// structure) must never proceed to being written back to disk.
+fn splice_sexp_into_string(contents: &str, sexp_block: &str) -> Result<String> {
+    let head = |s: &str| {
+        konnect_sexp::parse_sexp(s)
+            .ok()
+            .and_then(|n| n.head().map(str::to_string))
+    };
+
+    if head(contents).as_deref() != Some("kicad_pcb") {
+        anyhow::bail!(
+            "refusing to splice: board contents do not parse as a valid .kicad_pcb document \
+             (got head {:?}) — likely a truncated or torn read",
+            head(contents)
+        );
+    }
+
+    let trimmed = contents.trim_end();
     let last_paren = trimmed
         .rfind(')')
-        .ok_or_else(|| anyhow::anyhow!("board file {} has no closing paren", board_path.display()))?;
-    let mut out = String::with_capacity(raw.len() + sexp_block.len() + 8);
+        .ok_or_else(|| anyhow::anyhow!("board contents have no closing paren"))?;
+    let mut out = String::with_capacity(contents.len() + sexp_block.len() + 8);
     out.push_str(&trimmed[..last_paren]);
     out.push('\n');
     out.push_str(sexp_block);
     out.push('\n');
     out.push_str(&trimmed[last_paren..]);
     out.push('\n');
-    std::fs::write(board_path, out)
-        .with_context(|| format!("could not write board file {}", board_path.display()))?;
-    Ok(())
+
+    if head(&out).as_deref() != Some("kicad_pcb") {
+        anyhow::bail!(
+            "refusing to write spliced board: result no longer parses as a valid .kicad_pcb \
+             document after splicing (got head {:?})",
+            head(&out)
+        );
+    }
+
+    Ok(out)
 }
 
 pub struct KiCadIpcClient {
@@ -708,6 +748,15 @@ impl KiCadIpcClient {
     }
 
     /// Save the open board document.
+    ///
+    /// This fires KiCAD's SaveDocument command and returns as soon as KiCAD
+    /// *acks* the command — it does not confirm the on-disk write itself
+    /// has actually landed by the time this returns (the same
+    /// async-completion bug class `refill_zones` documents and works
+    /// around above). Callers that need the saved content back should
+    /// prefer `save_board_to_string()`, which round-trips the content over
+    /// IPC directly rather than trusting a disk write and then re-reading
+    /// it.
     pub fn save_board(&self) -> Result<()> {
         let doc = self.get_board_document()?;
         let cmd = kiapi::common::commands::SaveDocument {
@@ -715,6 +764,36 @@ impl KiCadIpcClient {
         };
         self.send_command(&cmd, "kiapi.common.commands.SaveDocument")?;
         Ok(())
+    }
+
+    /// Save the open board document to an in-memory string, without
+    /// touching disk, via KiCAD's SaveDocumentToString IPC command. Where
+    /// implemented, this is what `save_splice_revert` prefers over
+    /// `save_board()`'s write-then-reread-from-disk path, since it avoids
+    /// trusting an unverified disk write (see `save_board`'s own caveat).
+    /// Bails with a clear error if KiCAD returns empty contents (observed
+    /// when this command isn't implemented on a given KiCAD version), so
+    /// callers can fall back to the disk-based path.
+    pub fn save_board_to_string(&self) -> Result<String> {
+        let doc = self.get_board_document()?;
+        let cmd = kiapi::common::commands::SaveDocumentToString {
+            document: Some(doc),
+        };
+        let response_any = self.send_command(&cmd, "kiapi.common.commands.SaveDocumentToString")?;
+        let contents = match response_any {
+            Some(any) => {
+                let resp: kiapi::common::commands::SavedDocumentResponse = unpack_any(&any)?;
+                resp.contents
+            }
+            None => String::new(),
+        };
+        if contents.is_empty() {
+            anyhow::bail!(
+                "SaveDocumentToString returned empty contents — likely unimplemented on this \
+                 KiCAD version"
+            );
+        }
+        Ok(contents)
     }
 
     /// Resolve the on-disk path of the currently open board, via the same
@@ -799,6 +878,67 @@ impl KiCadIpcClient {
         };
         self.send_command(&cmd, "kiapi.common.commands.RevertDocument")?;
         Ok(())
+    }
+
+    /// Shared save→splice→revert sequence used by `add_via` and
+    /// `place_footprint` to route new items around KiCAD 10's dead
+    /// `ParseAndCreateItemsFromString` stub (see either caller's doc
+    /// comment for the full background).
+    ///
+    /// Serialized by `SAVE_SPLICE_LOCK` for the whole sequence: two
+    /// overlapping calls (e.g. one from `add_via`, one from
+    /// `place_footprint`) would otherwise race on the same board file via
+    /// a non-atomic read-modify-write.
+    ///
+    /// Prefers `save_board_to_string()` (an in-memory save with no
+    /// unverified disk round-trip) over `save_board()` + re-reading the
+    /// file from disk; if `SaveDocumentToString` isn't implemented on this
+    /// KiCAD version (signaled by `save_board_to_string()`'s "empty
+    /// contents" error), falls back to the disk-based path — but that
+    /// fallback still runs its content through the same validated
+    /// `splice_sexp_into_string`, never the old unchecked
+    /// file-splicing helper.
+    ///
+    /// Takes a pre-splice backup of the board file first; if anything in
+    /// the sequence fails — including `revert_document()` itself failing
+    /// or timing out — restores those bytes (best-effort) before
+    /// propagating the original error, so a half-applied splice is never
+    /// left on disk for some later unrelated save to persist back over.
+    fn save_splice_revert(&self, sexp_block: &str) -> Result<()> {
+        let _guard = SAVE_SPLICE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let board_path = self.board_file_path()?;
+        let backup = std::fs::read(&board_path).ok();
+
+        let result = (|| -> Result<()> {
+            let spliced = match self.save_board_to_string() {
+                Ok(contents) => splice_sexp_into_string(&contents, sexp_block)?,
+                Err(e) if e.to_string().contains("empty contents") => {
+                    // SaveDocumentToString isn't implemented on this KiCAD
+                    // version — fall back to the old disk-based save/read,
+                    // but still go through the validated splice helper.
+                    self.save_board()?;
+                    let contents = std::fs::read_to_string(&board_path).with_context(|| {
+                        format!("could not read board file {}", board_path.display())
+                    })?;
+                    splice_sexp_into_string(&contents, sexp_block)?
+                }
+                Err(e) => return Err(e),
+            };
+            std::fs::write(&board_path, spliced)
+                .with_context(|| format!("could not write board file {}", board_path.display()))?;
+            self.revert_document()
+        })();
+
+        if result.is_err() {
+            if let Some(bytes) = backup {
+                let _ = std::fs::write(&board_path, bytes);
+            }
+        }
+
+        result
     }
 
     /// Begin a commit (undo group).
@@ -911,9 +1051,10 @@ impl KiCadIpcClient {
     /// PadStack construction). KiCAD 10's ParseAndCreateItemsFromString is a dead,
     /// unimplemented no-op stub (confirmed by reading pcbnew/api/api_handler_pcb.cpp)
     /// — it validates and returns success without ever creating anything. Route
-    /// around it: save the live board to disk, splice the via S-expression in as a
-    /// top-level sibling, write it back, then have KiCAD reload from disk. Returns
-    /// the new via's real KIID (found by matching position + net after reload)
+    /// around it via `save_splice_revert()`: save the board (in-memory when
+    /// possible), splice the via S-expression in as a top-level sibling, write it
+    /// back, then have KiCAD reload. Returns the new via's real KIID (found by
+    /// matching position + net after reload)
     /// rather than echoing the caller's input args back as if they were confirmed.
     /// Also decodes the re-queried via's PadStack (drill.diameter + each
     /// copper_layers[].size) and confirms it matches the requested drill/pad
@@ -923,10 +1064,7 @@ impl KiCadIpcClient {
         let net_code = self.resolve_net_code(net_name)?;
         let sexp = crate::builders::via_sexp(net_name, net_code, x, y, drill, pad_size);
 
-        self.save_board()?;
-        let board_path = self.board_file_path()?;
-        splice_sexp_into_board(&board_path, &sexp)?;
-        self.revert_document()?;
+        self.save_splice_revert(&sexp)?;
 
         let x_nm = crate::builders::mm_to_nm(x);
         let y_nm = crate::builders::mm_to_nm(y);
@@ -1282,10 +1420,7 @@ impl KiCadIpcClient {
             reference,
         )?;
 
-        self.save_board()?;
-        let board_path = self.board_file_path()?;
-        splice_sexp_into_board(&board_path, &sexp)?;
-        self.revert_document()?;
+        self.save_splice_revert(&sexp)?;
 
         // Read back the observed state rather than echoing the caller's input
         // args — reloading and finding it is what actually proves the footprint
@@ -1380,5 +1515,47 @@ impl KiCadIpcClient {
         };
         self.send_command(&cmd, "kiapi.common.commands.RunAction")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splice_sexp_into_string_rejects_non_kicad_pcb_input() {
+        let err = splice_sexp_into_string("(footprint \"foo\")", "(via)")
+            .expect_err("non-kicad_pcb input must not splice");
+        assert!(
+            err.to_string()
+                .contains("do not parse as a valid .kicad_pcb"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn splice_sexp_into_string_rejects_truncated_input() {
+        // Missing closing paren — a torn/partial read of the board file.
+        let err = splice_sexp_into_string("(kicad_pcb (version 20240101)", "(via)")
+            .expect_err("truncated input must not splice");
+        assert!(
+            err.to_string()
+                .contains("do not parse as a valid .kicad_pcb"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn splice_sexp_into_string_inserts_block_before_final_paren() {
+        let out = splice_sexp_into_string("(kicad_pcb (version 20240101))", "(via (at 1 2))")
+            .expect("valid kicad_pcb input should splice cleanly");
+        assert!(out.contains("(via (at 1 2))"));
+        // The result must itself still parse as a well-formed kicad_pcb
+        // document (checked by splice_sexp_into_string itself before
+        // returning Ok) — i.e. the block landed inside the outer list,
+        // not appended after its closing paren.
+        let reparsed = konnect_sexp::parse_sexp(&out).expect("spliced output must reparse");
+        assert_eq!(reparsed.head(), Some("kicad_pcb"));
+        assert!(reparsed.find("via").is_some());
     }
 }
