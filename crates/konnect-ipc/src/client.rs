@@ -1061,7 +1061,11 @@ impl KiCadIpcClient {
     /// size — position+net alone previously let a wrong-geometry via (e.g.
     /// KiCAD silently falling back to a default drill/pad) report success.
     pub fn add_via(&self, net_name: &str, x: f64, y: f64, drill: f64, pad_size: f64) -> Result<String> {
-        let net_code = self.resolve_net_code(net_name)?;
+        // Validates net_name exists on the board (bails clearly if not);
+        // the resolved code itself is no longer needed downstream (see
+        // match_placed_via's doc comment for why matching by code was
+        // dropped in favor of matching by name).
+        self.resolve_net_code(net_name)?;
         let sexp = crate::builders::via_sexp(net_name, x, y, drill, pad_size);
 
         self.save_splice_revert(&sexp)?;
@@ -1084,7 +1088,7 @@ impl KiCadIpcClient {
         loop {
             let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbVia)?;
             if let Some(result) = Self::match_placed_via(
-                &items, x, y, x_nm, y_nm, net_name, net_code, drill, drill_nm, pad_size, size_nm,
+                &items, x, y, x_nm, y_nm, net_name, drill, drill_nm, pad_size, size_nm,
             )? {
                 return Ok(result);
             }
@@ -1115,7 +1119,6 @@ impl KiCadIpcClient {
         x_nm: i64,
         y_nm: i64,
         net_name: &str,
-        net_code: i32,
         drill: f64,
         drill_nm: i64,
         pad_size: f64,
@@ -1124,17 +1127,17 @@ impl KiCadIpcClient {
         for item in items {
             if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
                 let pos = via.position.unwrap_or_default();
-                // KiCAD omits the NetCode message entirely (leaves it None,
-                // not Some(0)) for net 0 — confirmed live. 0 is also net 0's
-                // fallback everywhere else in this file (see get_nets()'s
-                // IpcNet construction above), so match that convention here.
-                let via_net_code = via
-                    .net
-                    .as_ref()
-                    .and_then(|n| n.code.as_ref())
-                    .map(|c| c.value)
-                    .unwrap_or(0);
-                if pos.x_nm == x_nm && pos.y_nm == y_nm && via_net_code == net_code {
+                // Match by net NAME, not code: via_sexp() (as of 96a07f7)
+                // writes `(net "NAME")` with no code at all — matching a
+                // real via KiCAD itself wrote — so there's no reliable
+                // resolved-net_code to compare against here any more (it
+                // was captured before the reload, and reproduced live
+                // 2026-09-15 that it does not reliably match what a
+                // freshly-reloaded via reports back over IPC). The name is
+                // exactly what we asked for and what's authoritative in the
+                // file, so compare that directly instead.
+                let via_net_name = via.net.as_ref().map(|n| n.name.as_str()).unwrap_or("");
+                if pos.x_nm == x_nm && pos.y_nm == y_nm && via_net_name == net_name {
                     // Position and net matched, but KiCAD has separately
                     // reported an "accepted" mutation with the wrong result
                     // before (the whole reason every mutating tool in this
